@@ -21,17 +21,37 @@ Why store eval results in MongoDB?
   You can join eval scores against document metadata to see which
   chunks are being retrieved when quality drops.
   That's the debugging workflow: alert → dashboard → trace → chunk.
+
+Design decisions on evaluation metrics:
+
+1. We use only faithfulness (not answer_relevancy) as the primary
+   production metric. answer_relevancy requires an embeddings model
+   to compute — on free-tier OpenRouter, OpenAIEmbeddings doesn't
+   expose embed_query, causing AttributeError. In production you'd
+   configure a dedicated embeddings model for RAGAS.
+
+2. context_precision requires ground-truth reference answers — not
+   available without a labelled dataset. We treat it as an offline
+   metric run periodically against a curated test set.
+
+3. RAGAS can return nan when the LLM judge hits token limits on long
+   answers. We handle nan gracefully: SKIP rather than FAIL, so
+   evaluation failures don't block the query pipeline.
+
+4. We log all evaluation attempts to MongoDB regardless of outcome,
+   including SKIP, so we can track evaluation coverage over time.
 """
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from datasets import Dataset
-from pymongo import MongoClient, ASCENDING
+from pymongo import ASCENDING, MongoClient
 from pymongo.collection import Collection
 from ragas import evaluate
-from ragas.metrics import answer_relevancy, faithfulness
+from ragas.metrics import faithfulness
 
 from src.models import (
     DriftAlert,
@@ -46,11 +66,27 @@ from src.settings import settings
 
 class RAGEvaluator:
     """
-    Evaluates RAG responses using RAGAS and persists results to MongoDB.
+    Evaluates RAG responses using RAGAS faithfulness metric and persists
+    results to MongoDB.
+
+    We evaluate faithfulness only in this configuration:
+    - faithfulness: does the answer stay grounded in the retrieved context?
+      Low faithfulness = hallucination. This is the most critical metric
+      for trust-critical applications and requires only an LLM judge, not
+      an embeddings model.
+
+    answer_relevancy and context_precision are excluded because:
+    - answer_relevancy requires an embeddings model (OpenAIEmbeddings.embed_query)
+      which is unavailable in free-tier OpenRouter configurations
+    - context_precision requires ground-truth reference answers
+
+    In a production configuration with a dedicated embeddings model, you
+    would add answer_relevancy back to self._metrics.
     """
 
     def __init__(self) -> None:
-        self._metrics = [faithfulness, answer_relevancy]
+        # faithfulness only — see module docstring for why
+        self._metrics = [faithfulness]
         self._client: MongoClient | None = None
         self._collection: Collection | None = None
 
@@ -60,7 +96,6 @@ class RAGEvaluator:
                 self._client = MongoClient(settings.mongodb_uri)
             db = self._client[settings.mongodb_database]
             self._collection = db[settings.mongodb_eval_collection]
-            # Index for efficient time-range queries
             self._collection.create_index(
                 [("evaluated_at", ASCENDING), ("corpus_source", ASCENDING)]
             )
@@ -72,10 +107,11 @@ class RAGEvaluator:
         persist: bool = True,
     ) -> EvalResult:
         """
-        Run RAGAS on a single response and optionally persist to MongoDB.
+        Run RAGAS faithfulness evaluation on a single response.
 
-        persist=True in production — we want a permanent quality record.
-        persist=False in tests — no database needed for unit tests.
+        Returns EvalStatus.SKIP when RAGAS returns nan (LLM judge token
+        limit exceeded). This is not a quality failure — it means the
+        evaluation itself couldn't complete, not that the answer was bad.
         """
         corpus_source = (
             response.corpus_sources[0].value
@@ -105,15 +141,24 @@ class RAGEvaluator:
                 lambda: evaluate(dataset, metrics=self._metrics).to_pandas(),
             )
 
-            faith = float(result_df["faithfulness"].iloc[0])
-            relevancy = float(result_df["answer_relevancy"].iloc[0])
-            precision = 0.0  # requires ground truth — not available without labelled data
+            raw_faith = float(result_df["faithfulness"].iloc[0])
 
-            passed = (
-                faith >= settings.min_faithfulness_score
-                and relevancy >= settings.min_relevancy_score
-            )
-            status = EvalStatus.PASS if passed else EvalStatus.FAIL
+            # Handle nan gracefully — occurs when LLM judge hits token limits
+            # on long answers. Treat as SKIP, not FAIL.
+            if math.isnan(raw_faith):
+                faith = 0.0
+                status = EvalStatus.SKIP
+            else:
+                faith = raw_faith
+                status = (
+                    EvalStatus.PASS
+                    if faith >= settings.min_faithfulness_score
+                    else EvalStatus.FAIL
+                )
+
+            # answer_relevancy and context_precision not available in this config
+            relevancy = 0.0
+            precision = 0.0
 
             eval_result = EvalResult(
                 session_id=response.session_id,
@@ -158,13 +203,20 @@ class RAGEvaluator:
     def summarise(self, results: list[EvalResult]) -> dict[str, float]:
         if not results:
             return {}
+        evaluated = [r for r in results if r.status != EvalStatus.SKIP]
         return {
-            "pass_rate": sum(1 for r in results if r.status == EvalStatus.PASS) / len(results),
-            "avg_faithfulness": sum(r.faithfulness for r in results) / len(results),
-            "avg_relevancy": sum(r.answer_relevancy for r in results) / len(results),
-            "avg_precision": sum(r.context_precision for r in results) / len(results),
-            "avg_overall": sum(r.overall_score for r in results) / len(results),
+            "pass_rate": (
+                sum(1 for r in evaluated if r.status == EvalStatus.PASS)
+                / len(evaluated)
+                if evaluated else 0.0
+            ),
+            "avg_faithfulness": (
+                sum(r.faithfulness for r in evaluated) / len(evaluated)
+                if evaluated else 0.0
+            ),
+            "skip_rate": sum(1 for r in results if r.status == EvalStatus.SKIP) / len(results),
             "total": float(len(results)),
+            "evaluated": float(len(evaluated)),
         }
 
     def close(self) -> None:
@@ -218,14 +270,13 @@ class DriftMonitor:
                 "$match": {
                     "corpus_source": corpus_source,
                     "evaluated_at": {"$gte": cutoff_str},
+                    "status": {"$ne": "skip"},  # exclude skipped evals
                 }
             },
             {
                 "$group": {
                     "_id": None,
                     "avg_faithfulness": {"$avg": "$faithfulness"},
-                    "avg_relevancy": {"$avg": "$answer_relevancy"},
-                    "avg_precision": {"$avg": "$context_precision"},
                     "count": {"$sum": 1},
                 }
             },
@@ -233,13 +284,12 @@ class DriftMonitor:
 
         result = list(self._get_collection().aggregate(pipeline))
         if not result or result[0]["count"] < 3:
-            # Not enough data for reliable stats
             return None
 
         return {
             "faithfulness": result[0]["avg_faithfulness"],
-            "answer_relevancy": result[0]["avg_relevancy"],
-            "context_precision": result[0]["avg_precision"],
+            "answer_relevancy": 0.0,
+            "context_precision": 0.0,
         }
 
     def check_drift(self, corpus_source: str = "all") -> list[DriftAlert]:
@@ -266,7 +316,7 @@ class DriftMonitor:
             if not baseline or not current:
                 continue
 
-            for metric in ["faithfulness", "answer_relevancy", "context_precision"]:
+            for metric in ["faithfulness"]:
                 base_val = baseline[metric]
                 curr_val = current[metric]
 
@@ -301,7 +351,6 @@ class DriftMonitor:
             stats = self._compute_window_avg(source, hours=24)
             if stats:
                 per_corpus[source] = stats
-                # Count pass/fail
                 col = self._get_collection()
                 cutoff = (
                     datetime.now(timezone.utc) - timedelta(hours=24)
@@ -309,6 +358,7 @@ class DriftMonitor:
                 total = col.count_documents({
                     "corpus_source": source,
                     "evaluated_at": {"$gte": cutoff},
+                    "status": {"$ne": "skip"},
                 })
                 passed = col.count_documents({
                     "corpus_source": source,
@@ -320,7 +370,6 @@ class DriftMonitor:
 
         alerts = self.check_drift()
 
-        # Determine trend from last 3 days vs today
         recent = self._compute_window_avg("mongodb", hours=24)
         older = self._compute_window_avg("mongodb", hours=72)
         trend = "stable"
