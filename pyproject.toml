@@ -57,6 +57,9 @@ dev = [
 [project.scripts]
 ai-builder = "src.cli:app"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py311"
