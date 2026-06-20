@@ -31,7 +31,7 @@ from datasets import Dataset
 from pymongo import MongoClient, ASCENDING
 from pymongo.collection import Collection
 from ragas import evaluate
-from ragas.metrics import answer_relevancy, context_precision, faithfulness
+from ragas.metrics import answer_relevancy, faithfulness
 
 from src.models import (
     DriftAlert,
@@ -50,7 +50,7 @@ class RAGEvaluator:
     """
 
     def __init__(self) -> None:
-        self._metrics = [faithfulness, answer_relevancy, context_precision]
+        self._metrics = [faithfulness, answer_relevancy]
         self._client: MongoClient | None = None
         self._collection: Collection | None = None
 
@@ -107,7 +107,7 @@ class RAGEvaluator:
 
             faith = float(result_df["faithfulness"].iloc[0])
             relevancy = float(result_df["answer_relevancy"].iloc[0])
-            precision = float(result_df["context_precision"].iloc[0])
+            precision = 0.0  # requires ground truth — not available without labelled data
 
             passed = (
                 faith >= settings.min_faithfulness_score
