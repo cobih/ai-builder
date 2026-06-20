@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from typing import Any, Generator
 
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
@@ -72,7 +72,7 @@ def setup_telemetry() -> None:
             headers["Authorization"] = f"Bearer {settings.dash0_auth_token}"
 
         exporter = OTLPSpanExporter(
-            endpoint=settings.otel_endpoint,
+            endpoint=f"{settings.otel_endpoint}/v1/traces",
             headers=headers,
         )
         provider.add_span_processor(BatchSpanProcessor(exporter))
