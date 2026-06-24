@@ -16,7 +16,6 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore",
     )
 
     # ── MongoDB ───────────────────────────────────────────────
@@ -58,6 +57,14 @@ class Settings(BaseSettings):
     otel_endpoint: str = Field(default="http://localhost:4317")
     otel_service_name: str = Field(default="ai-builder")
     dash0_auth_token: str = Field(default="")
+
+    # ── Perception layer ──────────────────────────────────────
+    github_token: str = Field(default="", description="GitHub PAT for PR creation")
+    github_repo_owner: str = Field(default="cobih")
+    github_repo_name: str = Field(default="ai-builder")
+    perception_concurrency: int = Field(default=5)
+    eval_faithfulness_threshold: float = Field(default=0.75)
+    eval_judge_threshold: float = Field(default=0.70)
 
 
 settings = Settings()
