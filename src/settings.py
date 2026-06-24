@@ -16,6 +16,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # Silently pass through env vars not in this model
+                         # (OPENAI_API_KEY, OPENAI_BASE_URL for RAGAS;
+                         #  OTEL_EXPORTER_OTLP_* set by OTel auto-config)
     )
 
     # ── MongoDB ───────────────────────────────────────────────
